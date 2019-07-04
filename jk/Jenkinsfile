@@ -1,0 +1,177 @@
+pipeline {
+  agent any
+  stages {
+    stage('Start') {
+      steps {
+        sh 'printenv'
+      }
+    }
+    stage('Update Vars') {
+      steps {
+          sh 'sed s,s2t-image,$DTR/$Img_Space/$S2T_Name:$BUILD_NUMBER,g -i k8s/deploy.yaml'
+          sh 'sed s,dtr-secret,$DTR_Secret,g -i k8s/deploy.yaml'
+      }
+    }
+    stage('Build Speech2Text Demo') {
+      steps {
+        echo "Build Speech2Text Demo docker image"
+        sh 'docker image prune -f'
+        sh "docker build -t $DTR/$Img_Space/$S2T_Name:\"${env.BUILD_NUMBER}\" ."
+
+        echo "Pushing image into DTR"
+        sh 'docker login $DTR -u $DTR_USER -p $DTR_PASS'
+        sh "docker push $DTR/$Img_Space/$S2T_Name:\"${env.BUILD_NUMBER}\""
+      }
+    }
+
+    stage('ICS Login') {
+      steps {
+          sh 'bx login --apikey $ics_key -a https://api.ng.bluemix.net'
+          sh 'bx plugin list'
+          sh 'bx cs region-set $ics_region'
+          sh 'bx cs clusters region-set $ics_region'
+          sh 'bx cs cluster-config $ics_clustername'
+          sh 'cp /root/.bluemix/plugins/container-service/clusters/$ics_clustername/kube-config-$ics_location-$ics_clustername.yml /var/jenkins_home/icskube.yaml'
+          sh 'cp /root/.bluemix/plugins/container-service/clusters/$ics_clustername/ca-$ics_location-$ics_clustername.pem /var/jenkins_home/ca-$ics_location-$ics_clustername.pem'
+          sh 'sed "/^ *namespace:/s/default/${Img_Space}/g" -i /var/jenkins_home/icskube.yaml'
+          sh 'export KUBECONFIG=/var/jenkins_home/icskube.yaml'
+          sh 'cat /var/jenkins_home/icskube.yaml'
+          sh 'kubectl get nodes --kubeconfig /var/jenkins_home/icskube.yaml'
+       }
+    }
+
+    stage('Deploy Services - ICS') {
+      steps {
+        dir(path: 'k8s') {
+        echo "Deploy Speech2Text Demo"
+        sh 'kubectl delete -f deploy.yaml --kubeconfig /var/jenkins_home/icskube.yaml || true'
+        sh 'kubectl create -f deploy.yaml --kubeconfig /var/jenkins_home/icskube.yaml'
+
+        }
+      }
+      post {
+        always {
+           sh 'bx logout'
+        }
+      }
+    }
+
+// Next Stage for Different Cloud Provider
+//  ICP  //
+
+     stage('Approval - ICP (PRE-PROD)') {
+      parallel {
+        stage('sending email') {
+          steps {
+            mail(to: 'Mario.Fernandez@ibm.com', subject: "PRE_PROD - Job '${env.JOB_NAME}' is waiting for Approval", body: "Please go to '${env.RUN_DISPLAY_URL}'")
+          }
+        }
+        stage('approval') {
+          steps {
+            input 'OK to proceed ?'
+           }
+         }
+       }
+     }
+    stage('ICP Login') {
+      steps {
+          sh 'cloudctl login -a https://$icp_server:$icp_port -u $icp_user -p $icp_pass -n $Img_Space --skip-ssl-validation'
+          sh 'kubectl get nodes -n $Img_Space'
+      }
+    }
+
+
+    stage('Deploy Services - ICP') {
+      steps {
+        dir(path: 'k8s') {
+
+        echo "Deploy Speech2Text Demo"
+        sh 'kubectl delete -f deploy.yaml || true'
+        sh 'kubectl create -f deploy.yaml'
+
+        }
+      }
+      post {
+        always {
+           sh 'cloudctl logout'
+        }
+      }
+    }
+
+
+
+
+//  OC  //
+
+     stage('Approval - OC (PROD)') {
+      parallel {
+        stage('sending email') {
+          steps {
+            mail(to: 'Mario.Fernandez@ibm.com', subject: "PROD - Job '${env.JOB_NAME}' is waiting for approval", body: "Please go to '${env.RUN_DISPLAY_URL}'")
+          }
+        }
+        stage('approval') {
+          steps {
+            input 'OK to proceed ?'
+           }
+         }
+       }
+     }
+     stage('OC Login') {
+       steps {
+           sh 'oc login https://$oc_server:$oc_port --token=$oc_token --insecure-skip-tls-verify'
+           sh 'kubectl get deploy'
+       }
+     }
+
+    stage('Deploy Services - OC') {
+      steps {
+        dir(path: 'k8s') {
+
+        echo "Deploy Speech2Text Demo"
+        sh 'kubectl delete -f deploy.yaml || true'
+        sh 'kubectl create -f deploy.yaml'
+
+        }
+      }
+      post {
+        always {
+           sh 'oc logout'
+        }
+      }
+    }
+
+
+
+  }
+  post {
+        always {
+            sh 'docker logout || true'
+            sh 'cloudctl logout || true'
+        }
+  }
+  environment {
+    ics_key = credentials('ICS_KEY')
+    ics_region = 'us-south'
+    ics_clustername = 'mycluster'
+    ics_location = 'hou02'
+    Img_Space = 'default'
+    S2T_Name = 'speech2text'
+    DTR = 'gbs-mario-fernandez-docker-local.artifactory.swg-devops.com'
+    DTR_USER = credentials('DTR_USER')
+    DTR_PASS = credentials('DTR_PASS')
+    DTR_Secret = 'artifact'
+
+//  ICP  //
+    icp_server = 'bldbzt1160.bld.dst.ibm.com'
+    icp_port = '8443'
+    icp_user = credentials('ICP_USER')
+    icp_pass = credentials('ICP_PASS')
+
+//  OC  //
+    oc_server = 'redhat01.sby.ibm.com'
+    oc_port = '8443'
+    oc_token = credentials('OC_TOKEN')
+
+  }
+}

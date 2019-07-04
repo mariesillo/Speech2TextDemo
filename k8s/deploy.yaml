@@ -1,0 +1,48 @@
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: speech2text
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: speech2text
+    spec:
+      containers:
+      - name: speech2text
+        image: s2t-image
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: speech2text
+      imagePullSecrets:
+        - name: dtr-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: speech2text
+  name: speech2text
+spec:
+  ports:
+  - name: port-1
+    nodePort: 30080
+    port: 3000
+    protocol: TCP
+    targetPort: 3000
+  selector:
+    app: speech2text
+  type: NodePort
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+data:
+  .dockerconfigjson: eyJhdXRocyI6eyJnYnMtbWFyaW8tZmVybmFuZGV6LWRvY2tlci1sb2NhbC5hcnRpZmFjdG9yeS5zd2ctZGV2b3BzLmNvbSI6eyJ1c2VybmFtZSI6Ik1hcmlvLkZlcm5hbmRlekBpYm0uY29tIiwicGFzc3dvcmQiOiJDYW4xdDA4NDI0MiIsImVtYWlsIjoibWFyaW8uZmVybmFuZGV6QGlibS5jb20iLCJhdXRoIjoiVFdGeWFXOHVSbVZ5Ym1GdVpHVjZRR2xpYlM1amIyMDZRMkZ1TVhRd09EUXlOREk9In19fQ==
+kind: Secret
+metadata:
+  name: dtr-secret
+  namespace: default
+type: kubernetes.io/dockerconfigjson

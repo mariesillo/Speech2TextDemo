@@ -1,0 +1,250 @@
+pipeline {
+  agent any
+  stages {
+    stage('env') {
+      steps {
+        sh 'printenv'
+      }
+    }
+     stage('App Image Build') {
+        steps {
+           sh 'docker image prune -f'
+           sh "docker build -f $Dockerfile_name_BC -t $dtr/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\" ."
+           sh "docker tag $dtr/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\" $icp_aws_reg/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+           sh "docker tag $dtr/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\" $icp_sl_reg/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+       }
+     }
+     stage('Image Unit Test') {
+         parallel {
+             stage('Test On AWS Env') {
+                 agent {
+                      docker { image "ec2-18-216-199-101.us-east-2.compute.amazonaws.com:5000/default/bluecompute:${env.BUILD_NUMBER}"
+                               args  ""
+                      }
+                 }
+                 steps {
+                     sh '/StoreWebApp/Docker_test.sh'
+                 }
+                 post {
+                     failure {
+                         echo "Error Testing AWS Image"
+                         mail(to: 'mariesillo@gmail.com', subject: "Job '${env.JOB_NAME}' failed.", body: "AWS Image Testing Failed go to following URL for more detail '${env.RUN_DISPLAY_URL}'")
+                     }
+                 }
+             }
+             stage('Test On IBM Cloud Env') {
+                 agent {
+                      docker { image "ec2-18-216-199-101.us-east-2.compute.amazonaws.com:5000/default/bluecompute:${env.BUILD_NUMBER}"
+                               args  ""
+                     }
+                 }
+                 steps {
+                     sh 'echo "Testing on BZ"'
+                 }
+                 post {
+                     failure {
+                         echo "Error Testing BZ Image"
+                         mail(to: 'mariesillo@gmail.com', subject: "Job '${env.JOB_NAME}' failed.", body: "BZ Image Testing Failed go to following URL for more detail '${env.RUN_DISPLAY_URL}'")
+
+                     }
+                 }
+             }
+         }
+     }
+     stage('Push Image to ICP on IBM Cloud') {
+        steps {
+           sh 'docker logout $icp_sl_reg'
+           sh 'docker login $icp_sl_reg -u $icp_sl_user -p $icp_sl_pass'
+           sh "docker push $icp_sl_reg/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+           sh 'docker logout'
+       }
+     }
+     stage('Push Image to ICP on AWS') {
+        steps {
+           sh 'echo simple change'
+           sh 'docker logout $icp_aws_reg'
+           sh 'docker login $icp_aws_reg -u $icp_aws_user -p $icp_aws_pass'
+           sh "docker push $icp_aws_reg/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+           sh 'docker logout'
+        }
+     }
+     stage('Push Image to Docker Registry') {
+        steps {
+        sh 'docker logout $dtr'
+        sh 'docker login $dtr -u $dtr_user -p $dtr_pass'
+        sh "docker push $dtr/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+        sh 'docker logout'
+       }
+     }
+     stage('Login to ICP on AWS') {
+        steps {
+            sh 'bx pr login -a https://$icp_aws_server:$icp_port -u $icp_aws_user -p $icp_aws_pass -c $icp_aws_acctid --skip-ssl-validation'
+            sh 'bx pr cluster-config $icp_aws_clustername'
+            sh 'kubectl get nodes'
+            sh 'helm list --tls'
+        }
+      }
+      stage('Add App Repo to AWS') {
+         steps {
+            sh 'helm repo add $HelmRepoName $HelmRepoURL || true'
+        }
+      }
+      stage('Validate and Deploy Helm Chart AWS') {
+         steps {
+            sh """
+                #!/bin/bash
+                HELMCHART=\$( helm list --tls | awk  -v chart=$BlueChart \'\$1 ~ chart {print \$1}\' )
+                if [ -z  "\${HELMCHART}" ]
+                then
+                    helm install --name $BlueChart ibmcase/bluecompute-ce --tls || true
+                else
+                    exit 0
+                fi
+                """
+        }
+      }
+     stage('Rollout App Changes to AWS') {
+       steps {
+         sh "kubectl --namespace=$Img_Space set image deployments/bluecompute-web web=$icp_aws_reg/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+         sh 'kubectl --namespace=$Img_Space rollout status deployments/bluecompute-web'
+       }
+     }
+     stage('Unit Test on AWS') {
+        steps {
+           sh """
+              #!/bin/bash
+              WEBREADY=`kubectl get pods | awk  -v pod=bluecompute-web '\$1 ~ pod {if(match(\$3, "Running")){print \$1}}'`
+              if [ -z "\${WEBREADY}" ]
+              then
+                echo "Error not able to find a pod" >&2
+                exit 2
+              else
+                kubectl exec -it \${WEBREADY} -- /bin/bash -c 'npm test'
+              fi
+              """
+       }
+       post {
+           failure {
+               echo "Rollback to latest known working image"
+               sh 'kubectl --namespace=$Img_Space rollout undo deployments/bluecompute-web'
+               mail(to: 'mariesillo@gmail.com', subject: "Job '${env.JOB_NAME}' failed.", body: "Rollback is in progress. Please go to '${env.RUN_DISPLAY_URL}'")
+           }
+       }
+     }
+     stage('Perf test by Blazemeter') {
+      steps {
+        blazeMeterTest(testId: '6135784', workspaceId: '220441', getJtl: true, serverUrl: 'https://a.blazemeter.com', credentialsId: 'BlazemeterAPI-Mario')
+      }
+     }
+     stage('Approval to proceed') {
+      parallel {
+        stage('sending email') {
+          steps {
+            mail(to: 'mariesillo@gmail.com', subject: "Job '${env.JOB_NAME}' is waiting for input", body: "Please go to '${env.RUN_DISPLAY_URL}'")
+          }
+        }
+        stage('approval') {
+          steps {
+            input 'OK to proceed ?'
+           }
+         }
+       }
+     }
+     stage('Login to ICP on IBM Cloud') {
+        steps {
+            sh 'bx pr login -a https://$icp_sl_server:$icp_port -u $icp_sl_user -p $icp_sl_pass -c $icp_sl_acctid --skip-ssl-validation'
+            sh 'bx pr cluster-config $icp_sl_clustername'
+            sh 'kubectl get nodes'
+            sh 'helm list --tls'
+        }
+      }
+      stage('Add App Repo to IBM Cloud') {
+         steps {
+            sh 'helm repo add $HelmRepoName $HelmRepoURL || true'
+        }
+      }
+      stage('Validate and Deploy Helm Chart IBM Cloud') {
+         steps {
+            sh """
+                #!/bin/bash
+                HELMCHART=\$( helm list --tls | awk  -v chart=$BlueChart \'\$1 ~ chart {print \$1}\' )
+                if [ -z  "\${HELMCHART}" ]
+                then
+                    helm install --name $BlueChart ibmcase/bluecompute-ce --tls || true
+                else
+                    exit 0
+                fi
+                """
+        }
+      }
+      stage('Rollout App Changes to IBM Cloud') {
+        steps {
+          sh "kubectl --namespace=$Img_Space set image deployments/bluecompute-web web=$icp_sl_reg/$Img_Space/$BC_Name:\"${env.BUILD_NUMBER}\""
+          sh 'kubectl --namespace=$Img_Space rollout status deployments/bluecompute-web'
+        }
+      }
+      stage('System Integration Test') {
+         steps {
+            sh """
+               #!/bin/bash
+               WEBREADY=`kubectl get pods | awk  -v pod=bluecompute-web '\$1 ~ pod {if(match(\$3, "Running")){print \$1}}'`
+               if [ -z "\${WEBREADY}" ]
+               then
+                 echo "Error not able to find a pod" >&2
+                 exit 2
+               else
+                 kubectl exec -it \${WEBREADY} -- /bin/bash -c 'npm test'
+               fi
+               """
+        }
+        post {
+            failure {
+                echo "Rollback to latest known working image"
+                sh 'kubectl --namespace=$Img_Space rollout undo deployments/bluecompute-web'
+                mail(to: 'mariesillo@gmail.com', subject: "Job '${env.JOB_NAME}' failed.", body: "Rollback is in progress. Please go to '${env.RUN_DISPLAY_URL}'")
+            }
+        }
+      }
+   }
+   post {
+        always {
+            sh 'docker logout || true'
+            sh 'bx pr logout || true'
+        }
+  }
+  environment {
+
+  // Define following credentials under Jenkins as corresponding
+
+      icp_aws_user = credentials('ICP_AWS_USER')
+      icp_aws_pass = credentials('ICP_AWS_PASS')
+      icp_sl_user = credentials('ICP_SL_USER')
+      icp_sl_pass = credentials('ICP_SL_PASS')
+      dtr_user = credentials('DTR_USER')
+      dtr_pass = credentials('DTR_PASS')
+
+  // Modify following env variables as corresponding (replace <> with correct values)
+
+      icp_aws_server = 'icp-console-3e5f82b8ec91d6d9.elb.us-east-2.amazonaws.com'
+      icp_sl_server = '208.43.252.192'
+      icp_aws_acctid = 'id-mycluster-account'
+      icp_sl_acctid = 'id-myicpcluster-account'
+      icp_aws_clustername = 'mycluster'
+      icp_sl_clustername = 'myicpcluster'
+      icp_aws_reg = 'icp-console-3e5f82b8ec91d6d9.elb.us-east-2.amazonaws.com:8500'
+      icp_sl_reg = 'myicpcluster.icp:8500'
+      dtr = 'ec2-18-216-199-101.us-east-2.compute.amazonaws.com:5000'
+      email = 'mfolimon@mx1.ibm.com'
+
+
+  // Leave bellow env as follow
+
+      icp_port = '8443'
+      Dockerfile_name_BC = 'Dockerfile'
+      Img_Space = 'default'
+      BC_Name = 'bluecompute'
+      BlueChart = 'bluecompute'
+      HelmRepoName = 'ibmcase'
+      HelmRepoURL = 'https://raw.githubusercontent.com/ibm-cloud-architecture/refarch-cloudnative-kubernetes/master/docs/charts/bluecompute-ce'
+  }
+}
